@@ -167,7 +167,22 @@ class SyncTrainer:
         Returns: list of groups - one group (list of Trajectory) per sampled task.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+        n = len(self.train_tasks)
+
+        # 1. sample distinct indices from self.rng
+        num_samples = self.cfg.tasks_per_batch
+        indices = self.rng.sample(range(0, n), k=num_samples)
+        tasks = [self.train_tasks[i] for i in indices]
+
+        # 2. sample a list of rollouts per tasks; do this concurrently per task
+        group_size = self.cfg.group_size
+
+        result = await asyncio.gather(
+            *[collect_group(
+                policy, task, self.env_factory, group_size, self.agent_cls()
+            ) for task in tasks]
+        )
+        return result
 
     def build_batch(
         self, groups: list[list[Trajectory]]
@@ -180,7 +195,7 @@ class SyncTrainer:
         `record_training`, which merges `stats` into the step's record.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+        return groups_to_batch(groups, method=self.cfg.algo)
 
     async def update(self, seqs: list[TokenSequence]) -> dict:
         """Run one optimizer step on `seqs` through the session:
@@ -191,7 +206,13 @@ class SyncTrainer:
         here.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+        result = await self.session.train_step(
+            seqs=seqs,
+            loss_fn=self.cfg.loss_fn,
+            lr=self.cfg.lr,
+            grad_clip_norm=self.cfg.grad_clip_norm
+        )
+        return result
 
     async def evaluate_now(self, policy) -> dict:
         """Held-out evaluation of `policy`: the first cfg.eval_tasks
@@ -203,7 +224,18 @@ class SyncTrainer:
         entry script also calls this method for the step-0 baseline.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+        # 1. get the first n eval tasks, where n is specified in config
+
+        tasks = self.val_tasks[:self.cfg.eval_tasks]
+
+        # 2. evaluate those tasks on policy, each with k rollouts
+        k = self.cfg.eval_k
+        result = await evaluate_policy(
+            policy, tasks, self.env_factory, k,
+            agent_cls=self.agent_cls()
+        )
+
+        return result
 
     # ------------------------------------------------------------- driver --
 
@@ -238,4 +270,37 @@ class SyncTrainer:
             handle the periodic evaluations.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+
+        client = await self.session.new_sampling_client("step_000000")
+        policy = self.make_policy(client)
+
+        for t in range(1, self.cfg.num_steps + 1):
+            groups = await self.collect_batch(policy)
+            seqs, stats = self.build_batch(groups)
+
+            train_metrics = {}
+
+            if seqs:
+                # Update training weights
+                train_metrics = await self.update(seqs)
+
+                # Snapshot updated weights and refresh policy
+                client = await self.session.new_sampling_client(
+                    f"step_{t:06d}"
+                )
+                policy = self.make_policy(client)
+
+            # Record every step, including skipped steps
+            self.record_training(
+                step=t,
+                groups=groups,
+                seqs=seqs,
+                batch_stats=stats,
+                train_metrics=train_metrics,
+            )
+
+            # Evaluate latest policy
+            if self.eval_due(t):
+                eval_metrics = await self.evaluate_now(policy)
+                self.record_evaluation(t, eval_metrics)
+

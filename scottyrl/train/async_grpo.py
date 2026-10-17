@@ -292,7 +292,25 @@ class AsyncGRPOTrainer:
         them with whatever happens to be current after rollout work awaits.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+        task = self.tasks_by_id[task_id]
+        
+        groups = await collect_group(
+            policy, task, self.env_factory, 
+            self.cfg.group_size, agent_cls=self.agent_cls()
+        )
+
+        seqs, stats = groups_to_batch([groups], method="grpo")
+
+        rewards = [traj.reward for traj in groups]
+
+        result = GroupResult(
+            task_id = task_id,
+            policy_version = version,
+            sequences = seqs,
+            rewards = rewards
+        )
+            
+        return result
 
     async def rollout_worker(
         self,
@@ -308,7 +326,14 @@ class AsyncGRPOTrainer:
         Do not catch errors here, let them propagate.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+        for task_id in task_iter:
+            policy, version = self.active_policy()
+            group_result = await self.generate_group(
+                task_id=task_id,
+                policy=policy,
+                version=version
+            )
+            await results.put(group_result)
 
     async def collect_fresh_batch(
         self,
@@ -329,7 +354,20 @@ class AsyncGRPOTrainer:
         contribute no sequences.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+
+        # 1. collect the next unstale batch
+        result = []
+        while len(result) < self.cfg.groups_per_batch:
+            group = await results.get()
+            if self.version - group.policy_version > self.cfg.max_staleness:
+                stats.setdefault("groups_dropped_stale", 0)
+                stats["groups_dropped_stale"] += 1
+                continue
+            
+            result.append(group)
+
+
+        return result
 
     async def update(self, batch: list[GroupResult]) -> dict:
         """Run one optimizer step on the training sequences of every group
@@ -345,7 +383,14 @@ class AsyncGRPOTrainer:
         method.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+        seqs = [seq for group in batch for seq in group.sequences]
+
+        return await self.session.train_step(
+            seqs=seqs,
+            loss_fn=self.cfg.loss_fn,
+            lr=self.cfg.lr,
+            grad_clip_norm=self.cfg.grad_clip_norm,
+        )
 
     async def evaluate_now(self, policy: TinkerPolicy) -> dict:
         """Evaluate ``policy`` on held-out validation tasks.
@@ -362,8 +407,19 @@ class AsyncGRPOTrainer:
         also calls this method for the step-0 baseline.
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
 
+        # 1. get the first n eval tasks, where n is specified in config
+        
+        tasks = self.val_tasks[:self.cfg.eval_tasks]
+
+        # 2. evaluate those tasks on policy, each with k rollouts
+        k = self.cfg.eval_k
+        result = await evaluate_policy(
+            policy, tasks, self.env_factory, k,
+            agent_cls=self.agent_cls()
+        )
+
+        return result
     # ------------------------------------------------------------- driver --
 
     async def train(self) -> dict:
@@ -421,4 +477,76 @@ class AsyncGRPOTrainer:
         guidance: https://docs.python.org/3/library/asyncio-task.html#task-cancellation
         """
         # TODO(student): implement this method.
-        raise NotImplementedError
+
+        await self.publish_policy(0)
+
+        results: asyncio.Queue[GroupResult] = asyncio.Queue(
+            maxsize=self.cfg.queue_capacity
+        )
+        task_iter = itertools.cycle([task.id for task in self.train_tasks])
+        stats = {"train_steps": 0, "groups_consumed": 0, "groups_dropped_stale": 0}
+
+        workers = [
+            asyncio.create_task(self.rollout_worker(results, task_iter))
+            for _ in range(self.cfg.num_workers)
+        ]
+        evaluations: list[asyncio.Task] = []
+
+        try:
+            for t in range(1, self.cfg.num_steps + 1):
+                batch = await self._await_watching(
+                    self.collect_fresh_batch(results, stats), workers + evaluations
+                )
+                stats["groups_consumed"] += len(batch)
+
+                train_metrics = {}
+
+                if any(group.sequences for group in batch):
+                    # Update training weights
+                    train_metrics = await self.update(batch)
+
+                    # Snapshot updated weights and refresh policy
+                    await self.publish_policy(self.version + 1)
+
+                # Record every step, including skipped steps
+                self.record_training(t, batch, train_metrics)
+                stats["train_steps"] += 1
+
+                # Evaluate latest policy
+                if self.eval_due(t):
+                    policy, version = self.active_policy()
+                    evaluations.append(
+                        asyncio.create_task(self.run_evaluation(policy, version, t))
+                    )
+
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            await asyncio.gather(*evaluations)
+        except BaseException:
+            for task in workers + evaluations:
+                task.cancel()
+            await asyncio.gather(*workers, *evaluations, return_exceptions=True)
+            raise
+
+        return stats
+
+    async def _await_watching(self, awaitable, watched: list[asyncio.Task]):
+        """Await `awaitable`, but raise at once if any `watched` task fails,
+        so a dead worker or evaluation cannot leave the learner blocked."""
+        main = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                for task in watched:
+                    if task.done() and not task.cancelled() and task.exception() is not None:
+                        raise task.exception()
+                if main.done():
+                    return main.result()
+                await asyncio.wait(
+                    [main, *(task for task in watched if not task.done())],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+        finally:
+            if not main.done():
+                main.cancel()
+                await asyncio.gather(main, return_exceptions=True)

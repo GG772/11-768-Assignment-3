@@ -337,7 +337,20 @@ class TinkerSession:
         import tinker
 
         # TODO(student): implement this method.
-        raise NotImplementedError
+        params = tinker.AdamParams(
+            learning_rate=lr,
+            grad_clip_norm=grad_clip_norm,
+        )
+
+        # 1. assign gradient calculation to server
+        fw_future = await self.training_client.forward_backward_async(datums, loss_fn=loss_fn)
+
+        # 2. assign optim update to server
+        optim_future = await self.training_client.optim_step_async(params)
+
+        fwd_result = await fw_future.result_async()
+        opt_result = await optim_future.result_async()
+        return fwd_result, opt_result
 
     async def train_step(
         self,

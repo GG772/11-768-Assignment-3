@@ -33,7 +33,12 @@ def extension_suffix(accumulated: list[int], prompt_tokens: list[int]) -> list[i
         extension_suffix([], [1, 2])                 -> [1, 2]  (an empty sequence is a prefix of anything)
     """
     # TODO(student): implement this function.
-    raise NotImplementedError
+    n = len(accumulated)
+
+    if prompt_tokens[:n] == accumulated:
+        return prompt_tokens[n:]
+
+    return None
 
 
 def stitch_trajectory(traj: Trajectory) -> list[TokenSequence]:
@@ -79,7 +84,52 @@ def stitch_trajectory(traj: Trajectory) -> list[TokenSequence]:
     Returns: list of TokenSequence (possibly empty).
     """
     # TODO(student): implement this function.
-    raise NotImplementedError
+
+    result = []
+
+    tokens = []
+    mask = []
+    logprobs = []
+
+    def emit():
+        if len(tokens) >= 2 and any(mask):
+            result.append(TokenSequence(
+                tokens=tokens.copy(),
+                mask=mask.copy(),
+                logprobs=logprobs.copy(),
+                advantages=[0.0] * len(mask),
+            ))
+
+    for call in traj.calls:
+        suffix = extension_suffix(tokens, call.prompt_tokens)
+
+        # Broken extension: flush and start a new sequence
+        if suffix is None:
+            emit()
+            tokens = []
+            mask = []
+            logprobs = []
+            suffix = call.prompt_tokens
+
+        # Append new context tokens
+        for token in suffix:
+            if tokens:
+                mask.append(0)
+                logprobs.append(0.0)
+            tokens.append(token)
+
+        # Append completion tokens
+        for token, lp in zip(
+            call.completion_tokens,
+            call.completion_logprobs
+        ):
+            if tokens:
+                mask.append(1)
+                logprobs.append(lp)
+            tokens.append(token)
+
+    emit()
+    return result
 
 
 def trajectory_to_training_sequences(traj: Trajectory, advantage: float) -> list[TokenSequence]:
@@ -89,4 +139,10 @@ def trajectory_to_training_sequences(traj: Trajectory, advantage: float) -> list
     in an episode share the episode-level advantage.)
     """
     # TODO(student): implement this function.
-    raise NotImplementedError
+    result : list[TokenSequence] = stitch_trajectory(traj)
+
+    for seq in result:
+        for i in range(len(seq.advantages)):
+            if seq.mask[i] == 1:
+                seq.advantages[i] = advantage
+    return result

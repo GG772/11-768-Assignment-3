@@ -37,4 +37,17 @@ def compute_group_advantages(
     difficulty). See the handout's background section.
     """
     # TODO(student): implement this function.
-    raise NotImplementedError
+    
+    if method == "reinforce":
+        return list(rewards)
+    elif method == "grpo":
+        if len(rewards) < 2:
+            raise ValueError("GRPO requires at least 2 rewards")
+
+        if all(r == rewards[0] for r in rewards):
+            return None
+
+        mean = sum(rewards) / len(rewards)
+        return [r - mean for r in rewards]
+    else:
+        raise ValueError(f"Unknown method: {method}")
