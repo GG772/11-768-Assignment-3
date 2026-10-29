@@ -2,7 +2,8 @@
 
 Replays runs/<run_name>.jsonl into a new wandb run with the same name, config
 and metric keys that MetricsLogger would have logged live, so the run shows up
-next to the others in the project.
+next to the others in the project. It also logs time/elapsed_min, the training
+wall-clock taken from the log's "time" field, to plot against.
 
 Usage:
     uv run python scripts/upload_to_wandb.py p2b_number_search_grpo p3_number_search_async \
@@ -34,6 +35,14 @@ def main() -> None:
         log_path = ROOT / "runs" / f"{run_name}.jsonl"
         config_path = ROOT / required.get(run_name, f"configs/{run_name}.yaml")
         records = [json.loads(line) for line in log_path.read_text().splitlines()]
+        # wandb's own clock measures the upload, not training, so derive the
+        # run's wall-clock from the log's "time" field: minutes since the step-0
+        # baseline record, on training records only (an async eval lands late,
+        # and its row should keep the time of the training step it belongs to).
+        t0 = records[0]["time"]
+        for record in records:
+            if record["step"] == 0 or "train/success_rate" in record:
+                record["time/elapsed_min"] = (record["time"] - t0) / 60
         # An async run's background eval for step N lands in the log after
         # later training steps, and wandb drops any log whose step is below
         # the last one it saw. A stable sort puts it back at step N.
